@@ -82,10 +82,6 @@ async function fileToDataUrl(file) {
 }
 
 /** Flexible date parsing -> normalized DD/MM/YY */
-function pad2(n) {
-  return String(n).padStart(2, "0");
-}
-
 function parseDateFlexible(input) {
   const raw = sanitizeText(input);
   if (!raw) return { ok: false };
@@ -95,36 +91,21 @@ function parseDateFlexible(input) {
     .trim()
     .replace(/[\.\/\-\s]+$/g, "");
   const parts = cleaned.split(/[\/\.\-\s]+/).filter(Boolean);
-
-  // allow "DD/MM" (assume current year)
-  if (parts.length !== 2 && parts.length !== 3) return { ok: false };
-
+  if (parts.length !== 3) return { ok: false };
   const dd = Number(parts[0]);
   const mm = Number(parts[1]);
-  if (!Number.isFinite(dd) || !Number.isFinite(mm)) return { ok: false };
+  let yy = Number(parts[2]);
+  if (!Number.isFinite(dd) || !Number.isFinite(mm) || !Number.isFinite(yy)) return { ok: false };
   if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return { ok: false };
-
-  const nowYear = new Date().getFullYear();
-  let fullYear = nowYear;
-
-  if (parts.length === 3) {
-    let yy = Number(parts[2]);
-    if (!Number.isFinite(yy)) return { ok: false };
-    const yStr = String(parts[2]);
-    if (yStr.length === 4) fullYear = yy;
-    else if (yStr.length === 2) fullYear = 2000 + yy;
-    else if (yStr.length === 1) fullYear = 2000 + yy; // allow 6 -> 2006
-    else return { ok: false };
-  }
-
+  if (String(parts[2]).length === 4) yy = yy % 100;
+  else if (String(parts[2]).length === 1) yy = yy; // allow 6 -> 06
+  else if (String(parts[2]).length !== 2) return { ok: false };
+  const fullYear = 2000 + yy;
   const dt = new Date(fullYear, mm - 1, dd);
   if (dt.getFullYear() != fullYear || dt.getMonth() != mm - 1 || dt.getDate() != dd) return { ok: false };
-
-  const yy2 = fullYear % 100;
-  const norm = `${pad2(dd)}/${pad2(mm)}/${pad2(yy2)}`;
+  const norm = `${String(dd).padStart(2, "0")}/${String(mm).padStart(2, "0")}/${String(yy).padStart(2, "0")}`;
   return { ok: true, norm };
 }
-
 function normalizeDateInput(input) {
   const r = parseDateFlexible(input);
   return r.ok ? r.norm : "";
@@ -138,59 +119,20 @@ function isValidTimeHHMM(s) {
 }
 
 function formatDateLabel(v) {
-  if (!v) return "—";
-  const s = String(v).trim();
-
-  // already normalized
-  if (/^\d{2}\/\d{2}\/\d{2}$/.test(s)) return s;
-
-  // ISO date/time like 2026-01-02T...
-  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) {
-    const yy = Number(iso[1]) % 100;
-    return `${iso[3]}/${iso[2]}/${pad2(yy)}`;
-  }
-
-  const dt = new Date(s);
-  if (!Number.isNaN(dt.getTime())) {
-    const dd = pad2(dt.getDate());
-    const mm = pad2(dt.getMonth() + 1);
-    const yy = pad2(dt.getFullYear() % 100);
-    return `${dd}/${mm}/${yy}`;
-  }
-
-  return s;
+  return v ? v : "—";
 }
-
 function formatTimeLabel(v) {
-  if (!v) return "—";
-  const s = String(v).trim();
-
-  // already HH:MM
-  const hm = s.match(/^(\d{2}):(\d{2})/);
-  if (hm) return `${hm[1]}:${hm[2]}h`;
-
-  // ISO time like 1899-12-30T08:30:00.000Z
-  const dt = new Date(s);
-  if (!Number.isNaN(dt.getTime())) {
-    const y = dt.getUTCFullYear();
-    // time-only values from Sheets often become 1899-12-30...
-    const useUTC = y <= 1901;
-    const hh = pad2(useUTC ? dt.getUTCHours() : dt.getHours());
-    const mm = pad2(useUTC ? dt.getUTCMinutes() : dt.getMinutes());
-    return `${hh}:${mm}h`;
-  }
-
-  return s;
+  return v ? v : "—";
 }
 
 /** API wrapper for Apps Script */
 async function apiCall(action, payload = {}) {
   if (!API_URL) throw new Error("Missing VITE_SHEETS_API_URL");
+  const body = { ...payload, action };
   const res = await fetch(API_URL, {
-  method: "POST",
-  body: JSON.stringify(payload)
-});
+    method: "POST",
+    body: JSON.stringify(body),
+  });
   const json = await res.json().catch(() => null);
   if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
   if (!json?.ok) throw new Error(json?.error || "Unknown API error");
