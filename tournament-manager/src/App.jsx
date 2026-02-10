@@ -20,7 +20,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
  */
 
 const ADMIN_USERNAME = "admin";
-const ADMIN_PASSWORD = "turnir123";
+const ADMIN_PASSWORD = "adminpassword";
 
 const LS_KEYS = {
   events: "tm_events_v5",
