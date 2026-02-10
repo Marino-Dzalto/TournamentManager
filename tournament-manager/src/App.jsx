@@ -128,10 +128,11 @@ function formatTimeLabel(v) {
 /** API wrapper for Apps Script */
 async function apiCall(action, payload = {}) {
   if (!API_URL) throw new Error("Missing VITE_SHEETS_API_URL");
+  const body = { ...payload, action };
   const res = await fetch(API_URL, {
-  method: "POST",
-  body: JSON.stringify(payload)
-});
+    method: "POST",
+    body: JSON.stringify(body),
+  });
   const json = await res.json().catch(() => null);
   if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
   if (!json?.ok) throw new Error(json?.error || "Unknown API error");
