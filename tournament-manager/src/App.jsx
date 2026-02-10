@@ -1,19 +1,23 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * Tournament registration app with JSONBin.io backend
- * - Shared database accessible from all browsers/devices
- * - Public: see published events, register/unregister
- * - Admin: create/edit/delete events, view registrations, export .txt
+ * TournamentManager (Google Sheets storage via Apps Script Web App)
+ * - No custom backend server. Google Apps Script provides an HTTPS endpoint that reads/writes a Google Sheet.
+ * - Shared across browsers/devices.
+ *
+ * REQUIRED ENV:
+ *   VITE_SHEETS_API_URL = your deployed Apps Script Web App URL
+ *
+ * NOTE:
+ * - Security is limited without real auth. Admin login is still hardcoded in the UI.
+ * - If your Apps Script is deployed as "Anyone", anyone could call the endpoint.
+ *   For better security, you can require an adminKey inside Apps Script (still not perfect).
  */
 
 const ADMIN_USERNAME = "admin";
 const ADMIN_PASSWORD = "turnir123";
 
-// JSONBin.io configuration
-const JSONBIN_BIN_ID = import.meta.env.VITE_JSONBIN_BIN_ID || "YOUR_BIN_ID";
-const JSONBIN_API_KEY = import.meta.env.VITE_JSONBIN_API_KEY || "$2a$10$YOUR_API_KEY";
-const JSONBIN_BASE_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
+const API_URL = import.meta.env.VITE_SHEETS_API_URL;
 
 const LS_KEYS = {
   admin: "tm_admin_session_v1",
@@ -33,6 +37,27 @@ function uid(prefix = "id") {
 
 function sanitizeText(s) {
   return (s ?? "").toString().replace(/[\r\n]+/g, " ").trim();
+}
+
+function normalizeNeuronId(v) {
+  return sanitizeText(v).toUpperCase().replace(/\s+/g, "");
+}
+
+function toMoneyEUR(value) {
+  const n = Number(value);
+  if (Number.isNaN(n)) return String(value ?? "");
+  return new Intl.NumberFormat("hr-HR", {
+    style: "currency",
+    currency: "EUR",
+    minimumFractionDigits: 2,
+  }).format(n);
+}
+
+function asIntOrNaN(v) {
+  if (v === "" || v === null || v === undefined) return NaN;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return NaN;
+  return Math.trunc(n);
 }
 
 function downloadTxt(filename, content) {
@@ -56,67 +81,31 @@ async function fileToDataUrl(file) {
   });
 }
 
-function toMoneyEUR(value) {
-  const n = Number(value);
-  if (Number.isNaN(n)) return String(value ?? "");
-  return new Intl.NumberFormat("hr-HR", {
-    style: "currency",
-    currency: "EUR",
-    minimumFractionDigits: 2,
-  }).format(n);
-}
-
-function asIntOrNaN(v) {
-  if (v === "" || v === null || v === undefined) return NaN;
-  const n = Number(v);
-  if (!Number.isFinite(n)) return NaN;
-  return Math.trunc(n);
-}
-
-function normalizeNeuronId(v) {
-  return sanitizeText(v).toUpperCase().replace(/\s+/g, "");
-}
-
+/** Flexible date parsing -> normalized DD/MM/YY */
 function parseDateFlexible(input) {
   const raw = sanitizeText(input);
-  if (!raw) return { ok: false, reason: "empty" };
-
+  if (!raw) return { ok: false };
   const cleaned = raw
     .replace(/[^\d\/\.\-\s]/g, "")
     .replace(/\s+/g, " ")
     .trim()
     .replace(/[\.\/\-\s]+$/g, "");
   const parts = cleaned.split(/[\/\.\-\s]+/).filter(Boolean);
-  if (parts.length !== 3) return { ok: false, reason: "format" };
-
+  if (parts.length !== 3) return { ok: false };
   const dd = Number(parts[0]);
   const mm = Number(parts[1]);
   let yy = Number(parts[2]);
-
-  if (!Number.isFinite(dd) || !Number.isFinite(mm) || !Number.isFinite(yy)) return { ok: false, reason: "nan" };
-  if (mm < 1 || mm > 12) return { ok: false, reason: "month" };
-  if (dd < 1 || dd > 31) return { ok: false, reason: "day" };
-
-  if (String(parts[2]).length === 4) {
-    yy = yy % 100;
-  } else if (String(parts[2]).length === 2) {
-    // ok
-  } else if (String(parts[2]).length === 1) {
-    // ok
-  } else {
-    return { ok: false, reason: "year" };
-  }
-
+  if (!Number.isFinite(dd) || !Number.isFinite(mm) || !Number.isFinite(yy)) return { ok: false };
+  if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return { ok: false };
+  if (String(parts[2]).length === 4) yy = yy % 100;
+  else if (String(parts[2]).length === 1) yy = yy; // allow 6 -> 06
+  else if (String(parts[2]).length !== 2) return { ok: false };
   const fullYear = 2000 + yy;
   const dt = new Date(fullYear, mm - 1, dd);
-  if (dt.getFullYear() !== fullYear || dt.getMonth() !== mm - 1 || dt.getDate() !== dd) {
-    return { ok: false, reason: "invalid" };
-  }
-
+  if (dt.getFullYear() != fullYear || dt.getMonth() != mm - 1 || dt.getDate() != dd) return { ok: false };
   const norm = `${String(dd).padStart(2, "0")}/${String(mm).padStart(2, "0")}/${String(yy).padStart(2, "0")}`;
-  return { ok: true, norm, dd, mm, yy };
+  return { ok: true, norm };
 }
-
 function normalizeDateInput(input) {
   const r = parseDateFlexible(input);
   return r.ok ? r.norm : "";
@@ -126,95 +115,30 @@ function isValidTimeHHMM(s) {
   const v = sanitizeText(s);
   if (!/^\d{2}:\d{2}$/.test(v)) return false;
   const [hh, mm] = v.split(":").map((x) => Number(x));
-  if (hh < 0 || hh > 23) return false;
-  if (mm < 0 || mm > 59) return false;
-  return true;
-}
-
-function validateEmail(v) {
-  const s = (v || "").trim().toLowerCase();
-  if (!s) return false;
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+  return hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59;
 }
 
 function formatDateLabel(v) {
   return v ? v : "—";
 }
-
 function formatTimeLabel(v) {
   return v ? v : "—";
 }
 
-function normalizeLegacyEventFields(ev) {
-  if (!ev) return ev;
-
-  const preregFee =
-    ev.preregFee ?? ev.preRegistrationFee ?? ev.preRegFee ?? ev.fee ?? ev.price ?? 0;
-  const nonRegFee =
-    ev.nonRegFee ?? ev.nonRegisteredFee ?? ev.nonRegisteredPlayersFee ?? preregFee;
-
-  const date = ev.date ?? "";
-
-  return {
-    ...ev,
-    date,
-    preregFee,
-    nonRegFee,
-    playerCap: ev.playerCap ?? ev.cap ?? "",
-    swissRounds: ev.swissRounds ?? ev.swiss ?? "",
-    topCut: ev.topCut ?? ev.topcut ?? "",
-    notes: ev.notes ?? ev.otherNotes ?? "",
-    regStartTime: ev.regStartTime ?? ev.registrationStartTime ?? "",
-    tournamentStartTime: ev.tournamentStartTime ?? ev.startTime ?? "",
-    preregStartDate: ev.preregStartDate ?? ev.preRegStartDate ?? "",
-    preregEndDate: ev.preregEndDate ?? ev.preRegEndDate ?? ev.preregCancelEndDate ?? "",
-  };
+/** API wrapper for Apps Script */
+async function apiCall(action, payload = {}) {
+  if (!API_URL) throw new Error("Missing VITE_SHEETS_API_URL");
+  const res = await fetch(API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, ...payload }),
+  });
+  const json = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+  if (!json?.ok) throw new Error(json?.error || "Unknown API error");
+  return json.data;
 }
 
-/** ===== API FUNCTIONS ===== */
-async function fetchDatabase() {
-  try {
-    const response = await fetch(`${JSONBIN_BASE_URL}/latest`, {
-      headers: {
-        "X-Master-Key": JSONBIN_API_KEY,
-      },
-    });
-    
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    
-    const data = await response.json();
-    return data.record || { events: [], subscribers: [] };
-  } catch (error) {
-    console.error("Error fetching database:", error);
-    return { events: [], subscribers: [] };
-  }
-}
-
-async function updateDatabase(newData) {
-  try {
-    const response = await fetch(JSONBIN_BASE_URL, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Master-Key": JSONBIN_API_KEY,
-      },
-      body: JSON.stringify(newData),
-    });
-    
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    
-    return true;
-  } catch (error) {
-    console.error("Error updating database:", error);
-    return false;
-  }
-}
-
-/** ===== MAIN APP ===== */
 export default function App() {
   const [route, setRoute] = useState(() => {
     const m = window.location.hash.match(/^#\/event\/(.+)$/);
@@ -228,45 +152,29 @@ export default function App() {
   });
 
   const [events, setEvents] = useState([]);
-  const [subscribers, setSubscribers] = useState([]);
-  const [newsletterEmail, setNewsletterEmail] = useState("");
-  const [toast, setToast] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [registrations, setRegistrations] = useState([]);
+  const [subCount, setSubCount] = useState(0);
 
+  const [toast, setToast] = useState(null); // {type, text}
+  const [loading, setLoading] = useState(false);
+
+  // admin login
   const [loginUser, setLoginUser] = useState("");
   const [loginPass, setLoginPass] = useState("");
 
+  // modal
   const [modalOpen, setModalOpen] = useState(false);
-  const [modalMode, setModalMode] = useState("create");
-  const [editingId, setEditingId] = useState(null);
+  const [modalMode, setModalMode] = useState("create"); // create|edit
+  const [editingEvent, setEditingEvent] = useState(null);
 
+  // registration form
   const [regFirst, setRegFirst] = useState("");
   const [regLast, setRegLast] = useState("");
   const [regNeuronId, setRegNeuronId] = useState("");
   const [regMsg, setRegMsg] = useState(null);
 
-  // Load data from API on mount
-  useEffect(() => {
-    async function loadData() {
-      setLoading(true);
-      const data = await fetchDatabase();
-      setEvents(data.events || []);
-      setSubscribers(data.subscribers || []);
-      setLoading(false);
-    }
-    loadData();
-  }, []);
-
-  // Sync data to API whenever events or subscribers change
-  useEffect(() => {
-    if (loading) return; // Don't sync during initial load
-    
-    const timeoutId = setTimeout(async () => {
-      await updateDatabase({ events, subscribers });
-    }, 500); // Debounce updates
-    
-    return () => clearTimeout(timeoutId);
-  }, [events, subscribers, loading]);
+  // newsletter
+  const [newsletterEmail, setNewsletterEmail] = useState("");
 
   useEffect(() => {
     function onHash() {
@@ -288,33 +196,60 @@ export default function App() {
     return () => clearTimeout(t);
   }, [toast]);
 
-  const sortedEvents = useMemo(() => {
-    return [...events].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-  }, [events]);
+  const sortedEvents = useMemo(() => [...events], [events]);
 
   const currentEvent = useMemo(() => {
     if (route.name !== "event") return null;
     return events.find((e) => e.id === route.id) || null;
   }, [route, events]);
 
+  async function refreshHomeData() {
+    if (!API_URL) return;
+    setLoading(true);
+    try {
+      const data = await apiCall("list_events");
+      setEvents(Array.isArray(data) ? data : []);
+      const c = await apiCall("sub_count");
+      setSubCount(Number(c || 0));
+    } catch (e) {
+      setToast({ type: "err", text: String(e.message || e) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshRegistrations(eventId) {
+    if (!API_URL || !eventId) return;
+    setLoading(true);
+    try {
+      const data = await apiCall("list_registrations", { eventId });
+      setRegistrations(Array.isArray(data) ? data : []);
+    } catch (e) {
+      setToast({ type: "err", text: String(e.message || e) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshHomeData();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (route.name !== "event") {
+      setRegistrations([]);
+      return;
+    }
+    refreshRegistrations(route.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route]);
+
   function goHome() {
     window.location.hash = "#/";
   }
-
   function openEvent(id) {
     window.location.hash = `#/event/${id}`;
-  }
-
-  function openCreate() {
-    setModalMode("create");
-    setEditingId(null);
-    setModalOpen(true);
-  }
-
-  function openEdit(id) {
-    setModalMode("edit");
-    setEditingId(id);
-    setModalOpen(true);
   }
 
   function handleAdminLogin() {
@@ -327,121 +262,74 @@ export default function App() {
     }
     setToast({ type: "err", text: "Neispravno korisničko ime ili lozinka." });
   }
-
   function handleAdminLogout() {
     setAdmin(false);
     setToast({ type: "info", text: "Admin odjavljen." });
   }
 
-  function upsertEvent(next) {
-    setEvents((prev) => {
-      const idx = prev.findIndex((e) => e.id === next.id);
-      if (idx === -1) return [next, ...prev];
-      const copy = [...prev];
-      copy[idx] = next;
-      return copy;
-    });
+  function openCreate() {
+    setModalMode("create");
+    setEditingEvent(null);
+    setModalOpen(true);
+  }
+  function openEdit(ev) {
+    setModalMode("edit");
+    setEditingEvent(ev);
+    setModalOpen(true);
   }
 
-  function createEvent(payload) {
-    const now = Date.now();
-    const ev = normalizeLegacyEventFields({
-      id: uid("evt"),
-      title: payload.title,
-      date: payload.date,
-      location: payload.location,
-      preregFee: payload.preregFee,
-      nonRegFee: payload.nonRegFee,
-      playerCap: payload.playerCap,
-      swissRounds: payload.swissRounds,
-      topCut: payload.topCut,
-      regStartTime: payload.regStartTime,
-      tournamentStartTime: payload.tournamentStartTime,
-      preregStartDate: payload.preregStartDate,
-      preregEndDate: payload.preregEndDate,
-      description: payload.description || "",
-      notes: payload.notes || "",
-      imageDataUrl: payload.imageDataUrl,
-      createdAt: now,
-      updatedAt: now,
-      registrations: [],
-    });
-    upsertEvent(ev);
-    setToast({ type: "ok", text: "Događaj je objavljen." });
-  }
-
-  function updateEvent(id, patch) {
-    setEvents((prev) =>
-      prev.map((e) =>
-        e.id === id
-          ? normalizeLegacyEventFields({
-              ...e,
-              ...patch,
-              updatedAt: Date.now(),
-            })
-          : e
-      )
-    );
-    setToast({ type: "ok", text: "Objava je ažurirana." });
-  }
-
-  function deleteEvent(id) {
-    setEvents((prev) => prev.filter((e) => e.id !== id));
-    if (route.name === "event" && route.id === id) {
-      window.location.hash = "#/";
+  async function createEvent(payload) {
+    setLoading(true);
+    try {
+      const ev = {
+        id: uid("evt"),
+        ...payload,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      await apiCall("create_event", { event: ev });
+      setToast({ type: "ok", text: "Događaj je objavljen." });
+      await refreshHomeData();
+    } catch (e) {
+      setToast({ type: "err", text: String(e.message || e) });
+    } finally {
+      setLoading(false);
     }
-    setToast({ type: "info", text: "Događaj je obrisan." });
   }
 
-  function addRegistration(eventId, reg) {
-    setEvents((prev) =>
-      prev.map((e) => {
-        if (e.id !== eventId) return e;
-        const ne = normalizeLegacyEventFields(e);
-        const regs = Array.isArray(ne.registrations) ? ne.registrations : [];
-
-        const cap = asIntOrNaN(ne.playerCap);
-        if (Number.isFinite(cap) && cap > 0 && regs.length >= cap) return ne;
-
-        const nid = normalizeNeuronId(reg.neuronId);
-        if (regs.some((x) => normalizeNeuronId(x.neuronId) === nid)) return ne;
-
-        return {
-          ...ne,
-          registrations: [{ ...reg, neuronId: nid, id: uid("reg"), createdAt: Date.now() }, ...regs],
-          updatedAt: Date.now(),
-        };
-      })
-    );
+  async function updateEvent(eventId, patch) {
+    setLoading(true);
+    try {
+      await apiCall("update_event", { eventId, patch: { ...patch, updatedAt: Date.now() } });
+      setToast({ type: "ok", text: "Objava je ažurirana." });
+      await refreshHomeData();
+    } catch (e) {
+      setToast({ type: "err", text: String(e.message || e) });
+    } finally {
+      setLoading(false);
+    }
   }
 
-  function removeRegistrationByNeuronId(eventId, neuronId) {
-    const nid = normalizeNeuronId(neuronId);
-    let removed = false;
-
-    setEvents((prev) =>
-      prev.map((e) => {
-        if (e.id !== eventId) return e;
-        const ne = normalizeLegacyEventFields(e);
-        const regs = Array.isArray(ne.registrations) ? ne.registrations : [];
-        const nextRegs = regs.filter((r) => normalizeNeuronId(r.neuronId) !== nid);
-        if (nextRegs.length !== regs.length) removed = true;
-        return { ...ne, registrations: nextRegs, updatedAt: Date.now() };
-      })
-    );
-
-    return removed;
+  async function deleteEvent(eventId) {
+    setLoading(true);
+    try {
+      await apiCall("delete_event", { eventId });
+      if (route.name === "event" && route.id === eventId) goHome();
+      setToast({ type: "info", text: "Događaj je obrisan." });
+      await refreshHomeData();
+    } catch (e) {
+      setToast({ type: "err", text: String(e.message || e) });
+    } finally {
+      setLoading(false);
+    }
   }
 
-  function submitRegistration() {
+  async function submitRegistration() {
     setRegMsg(null);
     if (!currentEvent) return;
 
-    const ev = normalizeLegacyEventFields(currentEvent);
-    const regs = Array.isArray(ev.registrations) ? ev.registrations : [];
-    const cap = asIntOrNaN(ev.playerCap);
-
-    if (Number.isFinite(cap) && cap > 0 && regs.length >= cap) {
+    const cap = asIntOrNaN(currentEvent.playerCap);
+    if (Number.isFinite(cap) && cap > 0 && registrations.length >= cap) {
       setRegMsg({ type: "err", text: "Prijave su zatvorene (popunjen maksimalan broj igrača)." });
       return;
     }
@@ -449,72 +337,87 @@ export default function App() {
     const fn = regFirst.trim();
     const ln = regLast.trim();
     const nid = normalizeNeuronId(regNeuronId);
+    if (!fn || !ln || !nid) return setRegMsg({ type: "err", text: "Ime, prezime i Neuron ID su obavezni." });
 
-    if (!fn || !ln || !nid) {
-      setRegMsg({ type: "err", text: "Ime, prezime i Neuron ID su obavezni." });
-      return;
+    if (registrations.some((r) => normalizeNeuronId(r.neuronId) === nid)) {
+      return setRegMsg({ type: "err", text: "Već si prijavljen s tim Neuron ID-em." });
     }
 
-    if (regs.some((x) => normalizeNeuronId(x.neuronId) === nid)) {
-      setRegMsg({ type: "err", text: "Već si prijavljen s tim Neuron ID-em." });
-      return;
+    setLoading(true);
+    try {
+      await apiCall("register", { eventId: currentEvent.id, registration: { firstName: fn, lastName: ln, neuronId: nid } });
+      setRegMsg({ type: "ok", text: "Uspješno si prijavljen." });
+      setRegFirst("");
+      setRegLast("");
+      setRegNeuronId("");
+      await refreshRegistrations(currentEvent.id);
+    } catch (e) {
+      setRegMsg({ type: "err", text: String(e.message || e) });
+    } finally {
+      setLoading(false);
     }
-
-    addRegistration(ev.id, { firstName: fn, lastName: ln, neuronId: nid });
-    setRegMsg({ type: "ok", text: "Uspješno si prijavljen." });
-    setRegFirst("");
-    setRegLast("");
-    setRegNeuronId("");
   }
 
-  function submitUnregister() {
+  async function submitUnregister() {
     setRegMsg(null);
     if (!currentEvent) return;
-
-    const ev = normalizeLegacyEventFields(currentEvent);
     const nid = normalizeNeuronId(regNeuronId);
+    if (!nid) return setRegMsg({ type: "err", text: "Za odjavu je potreban Neuron ID." });
 
-    if (!nid) {
-      setRegMsg({ type: "err", text: "Za odjavu je potreban Neuron ID." });
-      return;
+    setLoading(true);
+    try {
+      const removed = await apiCall("unregister", { eventId: currentEvent.id, neuronId: nid });
+      if (!removed) setRegMsg({ type: "err", text: "Provjeri je li Neuron ID ispravan, nisi prijavljen." });
+      else setRegMsg({ type: "ok", text: "Uspješno si odjavljen." });
+      setRegNeuronId("");
+      await refreshRegistrations(currentEvent.id);
+    } catch (e) {
+      setRegMsg({ type: "err", text: String(e.message || e) });
+    } finally {
+      setLoading(false);
     }
-
-    const regs = Array.isArray(ev.registrations) ? ev.registrations : [];
-    const exists = regs.some((x) => normalizeNeuronId(x.neuronId) === nid);
-
-    if (!exists) {
-      setRegMsg({ type: "err", text: "Provjeri je li Neuron ID ispravan, nisi prijavljen." });
-      return;
-    }
-
-    removeRegistrationByNeuronId(ev.id, nid);
-    setRegMsg({ type: "ok", text: "Uspješno si odjavljen." });
-    setRegNeuronId("");
   }
 
-  function exportRegistrationsTxt(eventRaw) {
-    const event = normalizeLegacyEventFields(eventRaw);
-    const regs = Array.isArray(event?.registrations) ? event.registrations : [];
-    const lines = regs
-      .slice()
-      .reverse()
-      .map((r) => `${sanitizeText(r.firstName)}-${sanitizeText(r.lastName)}-${sanitizeText(r.neuronId)}`);
+  async function subscribeNewsletter() {
+    const e = newsletterEmail.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) {
+      setToast({ type: "err", text: "Unesi ispravnu e-mail adresu." });
+      return;
+    }
+    setLoading(true);
+    try {
+      const status = await apiCall("subscribe", { email: e });
+      if (status === "exists") setToast({ type: "info", text: "Već si pretplaćen." });
+      else setToast({ type: "ok", text: "Pretplata uspješna." });
+      setNewsletterEmail("");
+      await refreshHomeData();
+    } catch (err) {
+      setToast({ type: "err", text: String(err.message || err) });
+    } finally {
+      setLoading(false);
+    }
+  }
 
+  async function exportSubscribersTxt() {
+    setLoading(true);
+    try {
+      const subs = await apiCall("list_subscribers");
+      const lines = (subs || []).map((x) => x.email).filter(Boolean);
+      downloadTxt("newsletter_subscribers.txt", lines.join("\n") + (lines.length ? "\n" : ""));
+    } catch (e) {
+      setToast({ type: "err", text: String(e.message || e) });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function exportRegistrationsTxt(event) {
+    const regs = registrations || [];
+    const lines = regs.map((r) => `${sanitizeText(r.firstName)}-${sanitizeText(r.lastName)}-${sanitizeText(r.neuronId)}`);
     const header = `${sanitizeText(event.title)} | ${formatDateLabel(event.date)} | ${sanitizeText(event.location)}\n`;
     const content = header + lines.join("\n") + (lines.length ? "\n" : "");
     const fnameBase = sanitizeText(event.title).replace(/[^a-z0-9\- _]+/gi, "_") || "turnir";
     downloadTxt(`${fnameBase}_prijave.txt`, content);
-  }
-
-  if (loading) {
-    return (
-      <div className="app">
-        <header className="page-header">
-          <div className="brand">CYBERARENA</div>
-          <div className="page-title">Loading...</div>
-        </header>
-      </div>
-    );
   }
 
   return (
@@ -522,9 +425,7 @@ export default function App() {
       <header className="page-header">
         <div className="brand">CYBERARENA</div>
         <div className="page-title">{route.name === "home" ? "ACTIVE TOURNAMENTS" : "TOURNAMENT DETAILS"}</div>
-        <div className="page-subtitle">
-          {route.name === "home" ? "Select a tournament to register or view details" : "Read details and register"}
-        </div>
+        <div className="page-subtitle">{route.name === "home" ? "Select a tournament to register or view details" : "Read details and register"}</div>
         <div className="top-actions">
           {route.name === "event" ? (
             <button className="btn btn--ghost" onClick={goHome}>
@@ -539,52 +440,30 @@ export default function App() {
         </div>
       </header>
 
+      {!API_URL ? (
+        <div className="toast toast--err">
+          Nema API URL. Dodaj env varijablu: <b>VITE_SHEETS_API_URL</b> (Apps Script Web App URL).
+        </div>
+      ) : null}
+
       {toast ? <div className={`toast toast--${toast.type}`}>{toast.text}</div> : null}
+      {loading ? <div className="toast toast--info">Syncing…</div> : null}
 
       {route.name === "home" ? (
         <>
           <section className="newsletter">
             <div className="newsletter__inner">
               <div className="newsletter__title">Newsletter</div>
-              <div className="newsletter__subtitle">
-                Upiši e-mail i spremi ga u sustav za obavijesti o novim eventima.
-              </div>
-
+              <div className="newsletter__subtitle">Upiši e-mail i dobit ćeš obavijest kada se objavi novi event.</div>
               <div className="newsletter__row">
-                <input
-                  className="input"
-                  value={newsletterEmail}
-                  onChange={(e) => setNewsletterEmail(e.target.value)}
-                  placeholder="email@example.com"
-                />
-                <button
-                  className="btn"
-                  onClick={() => {
-                    const e = (newsletterEmail || "").trim().toLowerCase();
-                    if (!validateEmail(e)) {
-                      setToast({ type: "err", text: "Unesi ispravnu e-mail adresu." });
-                      return;
-                    }
-                    setSubscribers((prev) => {
-                      if (prev.some(sub => sub.email === e)) {
-                        setToast({ type: "info", text: "Već si pretplaćen s tom e-mail adresom." });
-                        return prev;
-                      }
-                      setToast({ type: "ok", text: "Pretplata uspješna." });
-                      return [...prev, { id: uid("sub"), email: e, createdAt: Date.now() }];
-                    });
-                    setNewsletterEmail("");
-                  }}
-                >
+                <input className="input" value={newsletterEmail} onChange={(e) => setNewsletterEmail(e.target.value)} placeholder="email@example.com" />
+                <button className="btn" onClick={subscribeNewsletter} disabled={!API_URL}>
                   Subscribe
                 </button>
               </div>
-
-              {subscribers.length > 0 ? (
-                <div className="newsletter__foot">
-                  Spremljeno: <b>{subscribers.length}</b> e-mail adresa
-                </div>
-              ) : null}
+              <div className="newsletter__foot">
+                Subscribers: <b>{subCount}</b>
+              </div>
             </div>
           </section>
 
@@ -596,28 +475,22 @@ export default function App() {
               </div>
             ) : (
               <div className="events-grid">
-                {sortedEvents.map((eRaw) => {
-                  const e = normalizeLegacyEventFields(eRaw);
-                  return (
-                    <div key={e.id} className="event-card-wrap">
-                      <button className="event-card" onClick={() => openEvent(e.id)}>
-                        <div className="event-card__image">
-                          {e.imageDataUrl ? <img src={e.imageDataUrl} alt={e.title} /> : <div className="img-placeholder" />}
-                        </div>
-                        <div className="event-card__meta">
-                          <div className="event-card__title">{e.title}</div>
-                          <div className="event-card__date">{formatDateLabel(e.date)}</div>
-                        </div>
+                {sortedEvents.map((e) => (
+                  <div key={e.id} className="event-card-wrap">
+                    <button className="event-card" onClick={() => openEvent(e.id)}>
+                      <div className="event-card__image">{e.imageDataUrl ? <img src={e.imageDataUrl} alt={e.title} /> : <div className="img-placeholder" />}</div>
+                      <div className="event-card__meta">
+                        <div className="event-card__title">{e.title}</div>
+                        <div className="event-card__date">{formatDateLabel(e.date)}</div>
+                      </div>
+                    </button>
+                    {admin ? (
+                      <button className="btn btn--small" onClick={() => openEdit(e)}>
+                        Edit
                       </button>
-
-                      {admin ? (
-                        <button className="btn btn--small" onClick={() => openEdit(e.id)}>
-                          Edit
-                        </button>
-                      ) : null}
-                    </div>
-                  );
-                })}
+                    ) : null}
+                  </div>
+                ))}
               </div>
             )}
           </section>
@@ -628,47 +501,22 @@ export default function App() {
 
               {!admin ? (
                 <div className="admin-login">
-                  <input
-                    className="admin-input"
-                    value={loginUser}
-                    onChange={(e) => setLoginUser(e.target.value)}
-                    placeholder="Username"
-                    autoComplete="username"
-                  />
-                  <input
-                    className="admin-input"
-                    type="password"
-                    value={loginPass}
-                    onChange={(e) => setLoginPass(e.target.value)}
-                    placeholder="Password"
-                    autoComplete="current-password"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") handleAdminLogin();
-                    }}
-                  />
+                  <input className="admin-input" value={loginUser} onChange={(e) => setLoginUser(e.target.value)} placeholder="Username" autoComplete="username" />
+                  <input className="admin-input" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Password" type="password" autoComplete="current-password" />
                   <button className="admin-button" onClick={handleAdminLogin}>
-                    Login
+                    Enter
                   </button>
                 </div>
               ) : (
                 <div className="admin-logged">
-                  <div className="admin-status">✓ Logged in as admin</div>
+                  <div className="admin-status">Admin je prijavljen ✅</div>
                   <div className="admin-actions-row">
-                    <button className="btn" onClick={openCreate}>
-                      Create new event
+                    <button className="admin-button" onClick={openCreate} disabled={!API_URL}>
+                      + New event
                     </button>
-                    {subscribers.length > 0 ? (
-                      <button
-                        className="btn btn--ghost"
-                        onClick={() => {
-                          const lines = subscribers.map(s => s.email);
-                          const content = lines.join("\n") + "\n";
-                          downloadTxt("newsletter_subscribers.txt", content);
-                        }}
-                      >
-                        Export subscribers ({subscribers.length})
-                      </button>
-                    ) : null}
+                    <button className="btn btn--small" onClick={exportSubscribersTxt} disabled={!API_URL}>
+                      Export subscribers
+                    </button>
                   </div>
                 </div>
               )}
@@ -678,20 +526,22 @@ export default function App() {
           <EventModal
             open={modalOpen}
             mode={modalMode}
-            initialEvent={modalMode === "edit" ? normalizeLegacyEventFields(events.find((e) => e.id === editingId) || null) : null}
+            initialEvent={editingEvent}
             onClose={() => setModalOpen(false)}
-            onCreate={(payload) => {
-              createEvent(payload);
+            onCreate={async (payload) => {
+              await createEvent(payload);
               setModalOpen(false);
             }}
-            onUpdate={(payload) => {
-              if (!editingId) return;
-              updateEvent(editingId, payload);
+            onUpdate={async (payload) => {
+              if (!editingEvent?.id) return;
+              await updateEvent(editingEvent.id, payload);
               setModalOpen(false);
             }}
-            onDelete={(id) => {
+            onDelete={async (id) => {
               if (!id) return;
-              deleteEvent(id);
+              const ok = window.confirm("Obrisati ovaj događaj? Ova radnja je nepovratna.");
+              if (!ok) return;
+              await deleteEvent(id);
               setModalOpen(false);
             }}
           />
@@ -699,123 +549,107 @@ export default function App() {
       ) : (
         <section className="detail-area">
           {!currentEvent ? (
-            <div className="empty-state">
-              <div className="empty-icon">❌</div>
-              <div className="empty-text">Event not found</div>
+            <div className="detail-card">
+              <div className="detail-title">Event not found</div>
+              <div className="detail-text">This event does not exist (or was removed).</div>
+              <div className="detail-actions">
+                <button className="btn" onClick={goHome}>
+                  Back to home
+                </button>
+              </div>
             </div>
           ) : (
             (() => {
-              const e = normalizeLegacyEventFields(currentEvent);
-              const regs = Array.isArray(e.registrations) ? e.registrations : [];
-              const cap = asIntOrNaN(e.playerCap);
-              const isFull = Number.isFinite(cap) && cap > 0 && regs.length >= cap;
+              const ev = currentEvent;
+              const cap = asIntOrNaN(ev.playerCap);
+              const capText = Number.isFinite(cap) && cap > 0 ? `${registrations.length}/${cap}` : `${registrations.length}/∞`;
+              const capReached = Number.isFinite(cap) && cap > 0 && registrations.length >= cap;
 
               return (
                 <div className="detail-grid">
                   <div className="detail-card">
-                    <div className="detail-hero">
-                      {e.imageDataUrl ? <img src={e.imageDataUrl} alt={e.title} /> : <div className="img-placeholder hero-placeholder" />}
-                    </div>
+                    <div className="detail-hero">{ev.imageDataUrl ? <img src={ev.imageDataUrl} alt={ev.title} /> : <div className="img-placeholder hero-placeholder" />}</div>
 
                     <div className="detail-content">
-                      <div className="detail-title">{e.title}</div>
+                      <div className="detail-title">{ev.title}</div>
 
                       <div className="detail-meta">
-                        <div className="meta-pill">📅 {formatDateLabel(e.date)}</div>
-                        <div className="meta-pill">📍 {e.location || "—"}</div>
-                        <div className="meta-pill">👥 {regs.length}{cap > 0 ? `/${cap}` : ""}</div>
+                        <div className="meta-pill">Date: {formatDateLabel(ev.date)}</div>
+                        <div className="meta-pill">Location: {ev.location}</div>
+                        <div className="meta-pill">Pre-reg: {toMoneyEUR(ev.preregFee)}</div>
+                        <div className="meta-pill">Non-reg: {toMoneyEUR(ev.nonRegFee)}</div>
+                        <div className="meta-pill">Players: {capText}</div>
+                        <div className="meta-pill">Swiss: {ev.swissRounds || "—"}</div>
+                        <div className="meta-pill">TopCut: {ev.topCut || "—"}</div>
+                        <div className="meta-pill">Reg opens: {formatTimeLabel(ev.regStartTime)}</div>
+                        <div className="meta-pill">Starts: {formatTimeLabel(ev.tournamentStartTime)}</div>
+                        <div className="meta-pill">Pre-reg from: {formatDateLabel(ev.preregStartDate)}</div>
+                        <div className="meta-pill">Pre-reg ends: {formatDateLabel(ev.preregEndDate)}</div>
                       </div>
 
-                      {e.description ? (
-                        <div className="detail-text">
-                          <div className="detail-description">{e.description}</div>
+                      <div className="detail-description">{ev.description || "—"}</div>
+
+                      {ev.notes ? (
+                        <div className="notes-box">
+                          <div className="notes-title">Other notes</div>
+                          <div className="notes-text">{ev.notes}</div>
                         </div>
                       ) : null}
 
-                      <div className="detail-meta">
-                        <div className="meta-pill">💰 PreReg: {toMoneyEUR(e.preregFee)}</div>
-                        <div className="meta-pill">💰 NonReg: {toMoneyEUR(e.nonRegFee)}</div>
-                        <div className="meta-pill">🏆 Swiss: {e.swissRounds || "—"}</div>
-                        <div className="meta-pill">🥇 TopCut: {e.topCut || "—"}</div>
-                      </div>
-
-                      <div className="detail-meta">
-                        <div className="meta-pill">⏰ Reg Start: {formatTimeLabel(e.regStartTime)}</div>
-                        <div className="meta-pill">⏰ Tournament: {formatTimeLabel(e.tournamentStartTime)}</div>
-                      </div>
-
-                      <div className="detail-meta">
-                        <div className="meta-pill">📆 PreReg Start: {formatDateLabel(e.preregStartDate)}</div>
-                        <div className="meta-pill">📆 PreReg End: {formatDateLabel(e.preregEndDate)}</div>
-                      </div>
-
-                      {e.notes ? (
-                        <div className="notes-box">
-                          <div className="notes-title">Additional Notes</div>
-                          <div className="notes-text">{e.notes}</div>
+                      {admin ? (
+                        <div className="detail-actions">
+                          <button className="btn btn--ghost" onClick={() => openEdit(ev)}>
+                            Edit event
+                          </button>
                         </div>
                       ) : null}
                     </div>
-
-                    {admin ? (
-                      <div className="detail-actions">
-                        <button className="btn btn--small" onClick={() => openEdit(e.id)}>
-                          Edit event
-                        </button>
-                      </div>
-                    ) : null}
                   </div>
 
                   <div className="side-stack">
                     <div className="panel">
-                      <div className="panel-head">
-                        <div>
-                          <div className="panel-title">Register</div>
-                          <div className="panel-subtitle">
-                            {isFull ? "Event is full!" : `${regs.length}${cap > 0 ? `/${cap}` : ""} registered`}
-                          </div>
-                        </div>
-                      </div>
-
-                      {regMsg ? <div className={`inline-alert inline-alert--${regMsg.type}`}>{regMsg.text}</div> : null}
+                      <div className="panel-title">Registration</div>
+                      <div className="panel-subtitle">Fields marked with * are required.</div>
 
                       <div className="form">
-                        <div>
-                          <div className="label">First Name *</div>
-                          <input className="input" value={regFirst} onChange={(e) => setRegFirst(e.target.value)} placeholder="John" disabled={isFull} />
-                        </div>
-                        <div>
-                          <div className="label">Last Name *</div>
-                          <input className="input" value={regLast} onChange={(e) => setRegLast(e.target.value)} placeholder="Doe" disabled={isFull} />
-                        </div>
-                        <div>
-                          <div className="label">Neuron ID *</div>
-                          <input className="input" value={regNeuronId} onChange={(e) => setRegNeuronId(e.target.value)} placeholder="ABC123" disabled={isFull} />
-                        </div>
-                      </div>
+                        <label className="label">* First name</label>
+                        <input className="input" value={regFirst} onChange={(e) => setRegFirst(e.target.value)} placeholder="First name" />
 
-                      <div className="dual-actions" style={{ marginTop: "12px" }}>
-                        <button className="btn" onClick={submitRegistration} disabled={isFull}>
-                          Register
-                        </button>
-                        <button className="btn btn--ghost" onClick={submitUnregister}>
-                          Unregister
-                        </button>
+                        <label className="label">* Last name</label>
+                        <input className="input" value={regLast} onChange={(e) => setRegLast(e.target.value)} placeholder="Last name" />
+
+                        <label className="label">* Neuron ID</label>
+                        <input className="input" value={regNeuronId} onChange={(e) => setRegNeuronId(e.target.value)} placeholder="Neuron ID" />
+
+                        <div className="dual-actions">
+                          <button className="btn" onClick={submitRegistration} disabled={capReached || !API_URL}>
+                            {capReached ? "Player cap reached" : "Register"}
+                          </button>
+                          <button className="btn btn--ghost" onClick={submitUnregister} disabled={!API_URL}>
+                            Unregister
+                          </button>
+                        </div>
+
+                        {capReached ? <div className="inline-alert inline-alert--err">Registrations are closed (player cap reached).</div> : null}
+                        {regMsg ? <div className={`inline-alert inline-alert--${regMsg.type}`}>{regMsg.text}</div> : null}
                       </div>
                     </div>
 
                     {admin ? (
                       <div className="panel">
                         <div className="panel-head">
-                          <div className="panel-title">Registrations ({regs.length})</div>
-                          {regs.length > 0 ? (
-                            <button className="btn btn--small" onClick={() => exportRegistrationsTxt(e)}>
-                              Export
-                            </button>
-                          ) : null}
+                          <div>
+                            <div className="panel-title">Registrations</div>
+                            <div className="panel-subtitle">
+                              Admin only • Total: <b>{registrations.length}</b>
+                            </div>
+                          </div>
+                          <button className="btn btn--small" onClick={() => exportRegistrationsTxt(ev)} disabled={registrations.length === 0}>
+                            Export .txt
+                          </button>
                         </div>
 
-                        {regs.length === 0 ? (
+                        {registrations.length === 0 ? (
                           <div className="empty-mini">No registrations yet.</div>
                         ) : (
                           <div className="table-wrap">
@@ -829,12 +663,12 @@ export default function App() {
                                 </tr>
                               </thead>
                               <tbody>
-                                {regs.map((r) => (
+                                {registrations.map((r) => (
                                   <tr key={r.id}>
                                     <td>{r.firstName}</td>
                                     <td>{r.lastName}</td>
                                     <td>{r.neuronId}</td>
-                                    <td className="muted">{new Date(r.createdAt).toLocaleString("hr-HR")}</td>
+                                    <td className="muted">{r.createdAt ? new Date(r.createdAt).toLocaleString("hr-HR") : "—"}</td>
                                   </tr>
                                 ))}
                               </tbody>
@@ -848,13 +682,36 @@ export default function App() {
               );
             })()
           )}
+
+          <EventModal
+            open={modalOpen}
+            mode={modalMode}
+            initialEvent={editingEvent}
+            onClose={() => setModalOpen(false)}
+            onCreate={async (payload) => {
+              await createEvent(payload);
+              setModalOpen(false);
+            }}
+            onUpdate={async (payload) => {
+              if (!editingEvent?.id) return;
+              await updateEvent(editingEvent.id, payload);
+              setModalOpen(false);
+            }}
+            onDelete={async (id) => {
+              if (!id) return;
+              const ok = window.confirm("Obrisati ovaj događaj? Ova radnja je nepovratna.");
+              if (!ok) return;
+              await deleteEvent(id);
+              setModalOpen(false);
+            }}
+          />
         </section>
       )}
     </div>
   );
 }
 
-/** ===== EVENT MODAL (CREATE / EDIT) ===== */
+/** ===== EVENT MODAL ===== */
 function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onDelete }) {
   const isEdit = mode === "edit";
 
@@ -881,28 +738,19 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
   useEffect(() => {
     if (!open) return;
     setErr("");
-
     setEventId(initialEvent?.id || null);
     setTitle(initialEvent?.title || "");
     setDate(initialEvent?.date || "");
     setLocation(initialEvent?.location || "");
-
-    const pFee =
-      initialEvent?.preregFee ?? initialEvent?.preRegistrationFee ?? initialEvent?.preRegFee ?? initialEvent?.fee ?? initialEvent?.price ?? "";
-    const nFee =
-      initialEvent?.nonRegFee ?? initialEvent?.nonRegisteredFee ?? initialEvent?.nonRegisteredPlayersFee ?? (pFee !== "" ? pFee : "");
-
-    setPreregFee(pFee === 0 || pFee ? String(pFee) : "");
-    setNonRegFee(nFee === 0 || nFee ? String(nFee) : "");
+    setPreregFee(initialEvent?.preregFee === 0 || initialEvent?.preregFee ? String(initialEvent.preregFee) : "");
+    setNonRegFee(initialEvent?.nonRegFee === 0 || initialEvent?.nonRegFee ? String(initialEvent.nonRegFee) : "");
     setPlayerCap(initialEvent?.playerCap === 0 || initialEvent?.playerCap ? String(initialEvent.playerCap) : "");
     setSwissRounds(initialEvent?.swissRounds === 0 || initialEvent?.swissRounds ? String(initialEvent.swissRounds) : "");
     setTopCut(initialEvent?.topCut === 0 || initialEvent?.topCut ? String(initialEvent.topCut) : "");
-
     setRegStartTime(initialEvent?.regStartTime || "");
     setTournamentStartTime(initialEvent?.tournamentStartTime || "");
     setPreregStartDate(initialEvent?.preregStartDate || "");
     setPreregEndDate(initialEvent?.preregEndDate || "");
-
     setDescription(initialEvent?.description || "");
     setNotes(initialEvent?.notes || "");
     setImageDataUrl(initialEvent?.imageDataUrl || "");
@@ -911,10 +759,8 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
   async function pickImage(file) {
     setErr("");
     if (!file) return;
-
     if (!file.type.startsWith("image/")) return setErr("Odaberi sliku (image/*).");
     if (file.size > 3 * 1024 * 1024) return setErr("Slika je prevelika (max 3MB).");
-
     const dataUrl = await fileToDataUrl(file);
     setImageDataUrl(dataUrl);
   }
@@ -924,42 +770,35 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
     e.stopPropagation();
     dropRef.current?.classList?.add("dropzone--active");
   }
-
   function onDragLeave(e) {
     e.preventDefault();
     e.stopPropagation();
     dropRef.current?.classList?.remove("dropzone--active");
   }
-
   async function onDrop(e) {
     e.preventDefault();
     e.stopPropagation();
     dropRef.current?.classList?.remove("dropzone--active");
     const file = e.dataTransfer?.files?.[0];
-    if (file) await pickImage(file);
+    await pickImage(file);
   }
 
   function submit() {
     setErr("");
-
     const t = title.trim();
-    const dt = sanitizeText(date);
+    const dtNorm = normalizeDateInput(date);
     const loc = location.trim();
-    const desc = description.trim();
-    const nts = notes.trim();
 
     if (!imageDataUrl) return setErr("Slika je obavezna.");
     if (!t) return setErr("Naziv događaja je obavezan.");
-    if (!dt) return setErr("Datum događaja je obavezan.");
-    const dtNorm = normalizeDateInput(dt);
     if (!dtNorm) return setErr("Datum nije ispravan. Primjeri: 01/03/26, 01.03.2026., 1/3/26");
     if (!loc) return setErr("Mjesto događaja je obavezno.");
 
-    if (preregFee === "" || preregFee === null || preregFee === undefined) return setErr("PreRegistration Fee je obavezan.");
-    if (nonRegFee === "" || nonRegFee === null || nonRegFee === undefined) return setErr("Non registered players Fee je obavezan.");
-    if (playerCap === "" || playerCap === null || playerCap === undefined) return setErr("Player Cap je obavezan.");
-    if (swissRounds === "" || swissRounds === null || swissRounds === undefined) return setErr("Swiss rounds je obavezan.");
-    if (topCut === "" || topCut === null || topCut === undefined) return setErr("TopCut je obavezan.");
+    if (preregFee === "") return setErr("PreRegistration Fee je obavezan.");
+    if (nonRegFee === "") return setErr("Non registered players Fee je obavezan.");
+    if (playerCap === "") return setErr("Player Cap je obavezan.");
+    if (swissRounds === "") return setErr("Swiss rounds je obavezan.");
+    if (topCut === "") return setErr("TopCut je obavezan.");
 
     if (!regStartTime) return setErr("Vrijeme Početak prijava je obavezno.");
     if (!isValidTimeHHMM(regStartTime)) return setErr("Vrijeme Početak prijava mora biti HH:MM (npr. 09:30).");
@@ -967,11 +806,9 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
     if (!tournamentStartTime) return setErr("Vrijeme Početak turnira je obavezno.");
     if (!isValidTimeHHMM(tournamentStartTime)) return setErr("Vrijeme Početak turnira mora biti HH:MM (npr. 10:00).");
 
-    if (!preregStartDate) return setErr("Datum Početak pretprijava je obavezan.");
     const preStartNorm = normalizeDateInput(preregStartDate);
     if (!preStartNorm) return setErr("Datum Početak pretprijava nije ispravan (npr. 01/03/26).");
 
-    if (!preregEndDate) return setErr("Datum Završetak pretprijava/odjava je obavezan.");
     const preEndNorm = normalizeDateInput(preregEndDate);
     if (!preEndNorm) return setErr("Datum Završetak pretprijava/odjava nije ispravan (npr. 09/03/26).");
 
@@ -1003,8 +840,8 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
       tournamentStartTime: sanitizeText(tournamentStartTime),
       preregStartDate: preStartNorm,
       preregEndDate: preEndNorm,
-      description: desc,
-      notes: nts,
+      description: description.trim(),
+      notes: notes.trim(),
       imageDataUrl,
     };
 
@@ -1046,8 +883,17 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
             </div>
 
             <div className="form-row">
-              <div className="label">* Event date (DD/MM/YY)</div>
-              <input className="input" value={date} onChange={(e) => setDate(e.target.value)} onBlur={() => { const n = normalizeDateInput(date); if (n) setDate(n); }} placeholder="10/02/26" />
+              <div className="label">* Event date</div>
+              <input
+                className="input"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                onBlur={() => {
+                  const n = normalizeDateInput(date);
+                  if (n) setDate(n);
+                }}
+                placeholder="01/03/26 or 01.03.2026."
+              />
             </div>
 
             <div className="form-row">
@@ -1066,13 +912,31 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
             </div>
 
             <div className="form-row">
-              <div className="label">* Datum Početak pretprijava (DD/MM/YY)</div>
-              <input className="input" value={preregStartDate} onChange={(e) => setPreregStartDate(e.target.value)} onBlur={() => { const n = normalizeDateInput(preregStartDate); if (n) setPreregStartDate(n); }} placeholder="01/02/26" />
+              <div className="label">* Datum Početak pretprijava</div>
+              <input
+                className="input"
+                value={preregStartDate}
+                onChange={(e) => setPreregStartDate(e.target.value)}
+                onBlur={() => {
+                  const n = normalizeDateInput(preregStartDate);
+                  if (n) setPreregStartDate(n);
+                }}
+                placeholder="01/02/26"
+              />
             </div>
 
             <div className="form-row">
-              <div className="label">* Datum Završetak pretprijava/odjava (DD/MM/YY)</div>
-              <input className="input" value={preregEndDate} onChange={(e) => setPreregEndDate(e.target.value)} onBlur={() => { const n = normalizeDateInput(preregEndDate); if (n) setPreregEndDate(n); }} placeholder="09/02/26" />
+              <div className="label">* Datum Završetak pretprijava/odjava</div>
+              <input
+                className="input"
+                value={preregEndDate}
+                onChange={(e) => setPreregEndDate(e.target.value)}
+                onBlur={() => {
+                  const n = normalizeDateInput(preregEndDate);
+                  if (n) setPreregEndDate(n);
+                }}
+                placeholder="09/02/26"
+              />
             </div>
 
             <div className="form-row">
@@ -1122,14 +986,7 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
           <div className="hint">Fields marked with * are required.</div>
           <div className="modal-actions">
             {isEdit ? (
-              <button
-                className="btn btn--ghost btn--danger"
-                onClick={() => {
-                  const ok = window.confirm("Obrisati ovaj događaj? Ova radnja je nepovratna.");
-                  if (!ok) return;
-                  onDelete?.(eventId);
-                }}
-              >
+              <button className="btn btn--ghost btn--danger" onClick={() => onDelete?.(eventId)}>
                 Delete
               </button>
             ) : null}
