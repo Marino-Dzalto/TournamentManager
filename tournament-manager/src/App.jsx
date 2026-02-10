@@ -1,31 +1,22 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 /**
- * Tournament registration app (client-only)
- * - Public: see published events (preview: image + name + date), open event, register/unregister
- * - Admin (hardcoded): login at bottom of home, create/edit event (image drag&drop),
- *   view registrations, export .txt (format: ime-prezime-neuronId)
- *
- * Storage: localStorage (events + admin session). Images are stored as DataURL (base64).
- *
- * Changes (v5):
- * - Date input format: DD/MM/YY (stored as DD/MM/YY string)
- * - Registration fields: First name*, Last name*, Neuron ID* (email removed)
- * - Unregister flow: enter Neuron ID, click "Unregister" -> removes matching entry if exists
- * - Admin adds:
- *   - Time: Registration start (Vrijeme Početak prijava)
- *   - Time: Tournament start (Vrijeme Početak turnira)
- *   - Date: Pre-reg start (Datum Početak pretprijava)
- *   - Date: Pre-reg end/cancel (Datum Završetak pretprijava/odjava)
+ * Tournament registration app with JSONBin.io backend
+ * - Shared database accessible from all browsers/devices
+ * - Public: see published events, register/unregister
+ * - Admin: create/edit/delete events, view registrations, export .txt
  */
 
 const ADMIN_USERNAME = "admin";
-const ADMIN_PASSWORD = "adminpassword";
+const ADMIN_PASSWORD = "turnir123";
+
+// JSONBin.io configuration
+const JSONBIN_BIN_ID = import.meta.env.VITE_JSONBIN_BIN_ID || "YOUR_BIN_ID";
+const JSONBIN_API_KEY = import.meta.env.VITE_JSONBIN_API_KEY || "$2a$10$YOUR_API_KEY";
+const JSONBIN_BASE_URL = `https://api.jsonbin.io/v3/b/${JSONBIN_BIN_ID}`;
 
 const LS_KEYS = {
-  events: "tm_events_v5",
   admin: "tm_admin_session_v1",
-  subscribers: "tm_subscribers_v1",
 };
 
 function safeJsonParse(v, fallback) {
@@ -54,42 +45,6 @@ function downloadTxt(filename, content) {
   a.click();
   a.remove();
   URL.revokeObjectURL(url);
-}
-
-
-function buildNewsletterMailto(event, subscribers) {
-  const toList = (subscribers || []).filter(Boolean).map((s) => s.trim().toLowerCase());
-  if (!event || toList.length === 0) return "";
-
-  const subject = `Novi event: ${sanitizeText(event.title)} (${formatDateLabel(event.date)})`;
-
-  const lines = [
-    `Objavljen je novi event: ${sanitizeText(event.title)}`,
-    ``,
-    `Datum: ${formatDateLabel(event.date)}`,
-    `Lokacija: ${sanitizeText(event.location)}`,
-    `PreRegistration Fee: ${toMoneyEUR(event.preregFee)}`,
-    `Non-registered Fee: ${toMoneyEUR(event.nonRegFee)}`,
-    `Player cap: ${event.playerCap || "—"}`,
-    `Swiss rounds: ${event.swissRounds || "—"}`,
-    `TopCut: ${event.topCut || "—"}`,
-    `Početak prijava: ${formatTimeLabel(event.regStartTime)}`,
-    `Početak turnira: ${formatTimeLabel(event.tournamentStartTime)}`,
-    `Pretprijave od: ${formatDateLabel(event.preregStartDate)}`,
-    `Pretprijave/odjava do: ${formatDateLabel(event.preregEndDate)}`,
-    ``,
-    `Detalji:`,
-    sanitizeText(event.description || "—"),
-    ``,
-    event.notes ? `Napomene: ${sanitizeText(event.notes)}` : "",
-    ``,
-    `Link: ${window.location.origin}${window.location.pathname}#/event/${event.id}`,
-  ].filter((x) => x !== "");
-
-  const body = lines.join("\n");
-
-  // Use BCC so recipients don't see each other (email client must support it)
-  return `mailto:?bcc=${encodeURIComponent(toList.join(","))}&subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 }
 
 async function fileToDataUrl(file) {
@@ -123,7 +78,6 @@ function normalizeNeuronId(v) {
 }
 
 function parseDateFlexible(input) {
-  // Accepts: 01/03/26, 1/3/26, 01.03.2026., 01-03-2026, 01 03 26, etc.
   const raw = sanitizeText(input);
   if (!raw) return { ok: false, reason: "empty" };
 
@@ -143,13 +97,12 @@ function parseDateFlexible(input) {
   if (mm < 1 || mm > 12) return { ok: false, reason: "month" };
   if (dd < 1 || dd > 31) return { ok: false, reason: "day" };
 
-  // Year: allow 2-digit or 4-digit
   if (String(parts[2]).length === 4) {
     yy = yy % 100;
   } else if (String(parts[2]).length === 2) {
     // ok
   } else if (String(parts[2]).length === 1) {
-    // ok (6 -> 06)
+    // ok
   } else {
     return { ok: false, reason: "year" };
   }
@@ -178,7 +131,6 @@ function isValidTimeHHMM(s) {
   return true;
 }
 
-
 function validateEmail(v) {
   const s = (v || "").trim().toLowerCase();
   if (!s) return false;
@@ -201,7 +153,6 @@ function normalizeLegacyEventFields(ev) {
   const nonRegFee =
     ev.nonRegFee ?? ev.nonRegisteredFee ?? ev.nonRegisteredPlayersFee ?? preregFee;
 
-  // If older date was YYYY-MM-DD, keep as-is; new format is DD/MM/YY.
   const date = ev.date ?? "";
 
   return {
@@ -220,9 +171,51 @@ function normalizeLegacyEventFields(ev) {
   };
 }
 
+/** ===== API FUNCTIONS ===== */
+async function fetchDatabase() {
+  try {
+    const response = await fetch(`${JSONBIN_BASE_URL}/latest`, {
+      headers: {
+        "X-Master-Key": JSONBIN_API_KEY,
+      },
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    
+    const data = await response.json();
+    return data.record || { events: [], subscribers: [] };
+  } catch (error) {
+    console.error("Error fetching database:", error);
+    return { events: [], subscribers: [] };
+  }
+}
+
+async function updateDatabase(newData) {
+  try {
+    const response = await fetch(JSONBIN_BASE_URL, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Master-Key": JSONBIN_API_KEY,
+      },
+      body: JSON.stringify(newData),
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    
+    return true;
+  } catch (error) {
+    console.error("Error updating database:", error);
+    return false;
+  }
+}
+
 /** ===== MAIN APP ===== */
 export default function App() {
-  // route: {name:'home'} | {name:'event', id}
   const [route, setRoute] = useState(() => {
     const m = window.location.hash.match(/^#\/event\/(.+)$/);
     return m ? { name: "event", id: m[1] } : { name: "home" };
@@ -234,42 +227,46 @@ export default function App() {
     return !!parsed?.isAdmin;
   });
 
-  const [events, setEvents] = useState(() => {
-    // migrate older keys if present
-    const raw =
-      localStorage.getItem(LS_KEYS.events) ||
-      localStorage.getItem("tm_events_v4") ||
-      localStorage.getItem("tm_events_v3") ||
-      localStorage.getItem("tm_events_v2") ||
-      localStorage.getItem("tm_events_v1");
-    const parsed = safeJsonParse(raw, []);
-    return Array.isArray(parsed) ? parsed.map(normalizeLegacyEventFields) : [];
-  });
-
-  const [subscribers, setSubscribers] = useState(() => {
-    const raw = localStorage.getItem(LS_KEYS.subscribers);
-    const parsed = safeJsonParse(raw, []);
-    return Array.isArray(parsed) ? parsed : [];
-  });
-
+  const [events, setEvents] = useState([]);
+  const [subscribers, setSubscribers] = useState([]);
   const [newsletterEmail, setNewsletterEmail] = useState("");
+  const [toast, setToast] = useState(null);
+  const [loading, setLoading] = useState(true);
 
-  const [toast, setToast] = useState(null); // {type:'ok'|'err'|'info', text}
-
-  // admin login fields (bottom)
   const [loginUser, setLoginUser] = useState("");
   const [loginPass, setLoginPass] = useState("");
 
-  // create/edit modal
   const [modalOpen, setModalOpen] = useState(false);
-  const [modalMode, setModalMode] = useState("create"); // create | edit
+  const [modalMode, setModalMode] = useState("create");
   const [editingId, setEditingId] = useState(null);
 
-  // registration form
   const [regFirst, setRegFirst] = useState("");
   const [regLast, setRegLast] = useState("");
   const [regNeuronId, setRegNeuronId] = useState("");
-  const [regMsg, setRegMsg] = useState(null); // {type, text}
+  const [regMsg, setRegMsg] = useState(null);
+
+  // Load data from API on mount
+  useEffect(() => {
+    async function loadData() {
+      setLoading(true);
+      const data = await fetchDatabase();
+      setEvents(data.events || []);
+      setSubscribers(data.subscribers || []);
+      setLoading(false);
+    }
+    loadData();
+  }, []);
+
+  // Sync data to API whenever events or subscribers change
+  useEffect(() => {
+    if (loading) return; // Don't sync during initial load
+    
+    const timeoutId = setTimeout(async () => {
+      await updateDatabase({ events, subscribers });
+    }, 500); // Debounce updates
+    
+    return () => clearTimeout(timeoutId);
+  }, [events, subscribers, loading]);
 
   useEffect(() => {
     function onHash() {
@@ -284,14 +281,6 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(LS_KEYS.admin, JSON.stringify({ isAdmin: admin, ts: Date.now() }));
   }, [admin]);
-
-  useEffect(() => {
-    localStorage.setItem(LS_KEYS.events, JSON.stringify(events));
-  }, [events]);
-
-  useEffect(() => {
-    localStorage.setItem(LS_KEYS.subscribers, JSON.stringify(subscribers));
-  }, [subscribers]);
 
   useEffect(() => {
     if (!toast) return;
@@ -359,7 +348,7 @@ export default function App() {
     const ev = normalizeLegacyEventFields({
       id: uid("evt"),
       title: payload.title,
-      date: payload.date, // DD/MM/YY
+      date: payload.date,
       location: payload.location,
       preregFee: payload.preregFee,
       nonRegFee: payload.nonRegFee,
@@ -379,14 +368,6 @@ export default function App() {
     });
     upsertEvent(ev);
     setToast({ type: "ok", text: "Događaj je objavljen." });
-
-    // No-backend newsletter: prepare a mailto draft (admin can send via their email client)
-    if (subscribers.length > 0) {
-      const link = buildNewsletterMailto(ev, subscribers);
-      if (link) {
-        setToast({ type: "info", text: "Newsletter: klikni 'Send' u admin dijelu za slanje e-mail obavijesti." });
-      }
-    }
   }
 
   function updateEvent(id, patch) {
@@ -406,7 +387,6 @@ export default function App() {
 
   function deleteEvent(id) {
     setEvents((prev) => prev.filter((e) => e.id !== id));
-    // If currently viewing this event, go home
     if (route.name === "event" && route.id === id) {
       window.location.hash = "#/";
     }
@@ -424,7 +404,6 @@ export default function App() {
         if (Number.isFinite(cap) && cap > 0 && regs.length >= cap) return ne;
 
         const nid = normalizeNeuronId(reg.neuronId);
-        // prevent duplicates by neuron id
         if (regs.some((x) => normalizeNeuronId(x.neuronId) === nid)) return ne;
 
         return {
@@ -500,7 +479,6 @@ export default function App() {
       return;
     }
 
-    // We need removed result, but setState is async; do check synchronously on current list too.
     const regs = Array.isArray(ev.registrations) ? ev.registrations : [];
     const exists = regs.some((x) => normalizeNeuronId(x.neuronId) === nid);
 
@@ -526,6 +504,17 @@ export default function App() {
     const content = header + lines.join("\n") + (lines.length ? "\n" : "");
     const fnameBase = sanitizeText(event.title).replace(/[^a-z0-9\- _]+/gi, "_") || "turnir";
     downloadTxt(`${fnameBase}_prijave.txt`, content);
+  }
+
+  if (loading) {
+    return (
+      <div className="app">
+        <header className="page-header">
+          <div className="brand">CYBERARENA</div>
+          <div className="page-title">Loading...</div>
+        </header>
+      </div>
+    );
   }
 
   return (
@@ -554,12 +543,11 @@ export default function App() {
 
       {route.name === "home" ? (
         <>
-          
           <section className="newsletter">
             <div className="newsletter__inner">
               <div className="newsletter__title">Newsletter</div>
               <div className="newsletter__subtitle">
-                Upiši e-mail i spremi ga u sustav za obavijesti o novim eventima. (Bez backenda: e-mail se sprema u ovaj preglednik.)
+                Upiši e-mail i spremi ga u sustav za obavijesti o novim eventima.
               </div>
 
               <div className="newsletter__row">
@@ -578,12 +566,12 @@ export default function App() {
                       return;
                     }
                     setSubscribers((prev) => {
-                      if (prev.includes(e)) {
+                      if (prev.some(sub => sub.email === e)) {
                         setToast({ type: "info", text: "Već si pretplaćen s tom e-mail adresom." });
                         return prev;
                       }
                       setToast({ type: "ok", text: "Pretplata uspješna." });
-                      return [e, ...prev];
+                      return [...prev, { id: uid("sub"), email: e, createdAt: Date.now() }];
                     });
                     setNewsletterEmail("");
                   }}
@@ -634,7 +622,6 @@ export default function App() {
             )}
           </section>
 
-          {/* Admin login + actions at bottom */}
           <section className="admin-section">
             <div className="admin-box">
               <h3>ADMIN ACCESS</h3>
@@ -650,50 +637,38 @@ export default function App() {
                   />
                   <input
                     className="admin-input"
+                    type="password"
                     value={loginPass}
                     onChange={(e) => setLoginPass(e.target.value)}
                     placeholder="Password"
-                    type="password"
                     autoComplete="current-password"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleAdminLogin();
+                    }}
                   />
                   <button className="admin-button" onClick={handleAdminLogin}>
-                    Enter
+                    Login
                   </button>
                 </div>
               ) : (
                 <div className="admin-logged">
-                  <div className="admin-status">Admin je prijavljen ✅</div>
+                  <div className="admin-status">✓ Logged in as admin</div>
                   <div className="admin-actions-row">
-                    <button className="admin-button" onClick={openCreate}>
-                      + New event
+                    <button className="btn" onClick={openCreate}>
+                      Create new event
                     </button>
-
-                    <button
-                      className="btn btn--small"
-                      onClick={() => {
-                        const content = subscribers.join("\n") + (subscribers.length ? "\n" : "");
-                        downloadTxt("newsletter_subscribers.txt", content);
-                      }}
-                      disabled={subscribers.length === 0}
-                    >
-                      Export subscribers
-                    </button>
-
-                    <button
-                      className="btn btn--small"
-                      onClick={() => {
-                        const latest = sortedEvents[0] ? normalizeLegacyEventFields(sortedEvents[0]) : null;
-                        const link = buildNewsletterMailto(latest, subscribers);
-                        if (!link) {
-                          setToast({ type: "err", text: "Nema eventa ili nema subscriber-a." });
-                          return;
-                        }
-                        window.location.href = link;
-                      }}
-                      disabled={subscribers.length === 0 || sortedEvents.length === 0}
-                    >
-                      Send newsletter
-                    </button>
+                    {subscribers.length > 0 ? (
+                      <button
+                        className="btn btn--ghost"
+                        onClick={() => {
+                          const lines = subscribers.map(s => s.email);
+                          const content = lines.join("\n") + "\n";
+                          downloadTxt("newsletter_subscribers.txt", content);
+                        }}
+                      >
+                        Export subscribers ({subscribers.length})
+                      </button>
+                    ) : null}
                   </div>
                 </div>
               )}
@@ -724,110 +699,120 @@ export default function App() {
       ) : (
         <section className="detail-area">
           {!currentEvent ? (
-            <div className="detail-card">
-              <div className="detail-title">Event not found</div>
-              <div className="detail-text">This event does not exist (or was removed).</div>
-              <div className="detail-actions">
-                <button className="btn" onClick={goHome}>
-                  Back to home
-                </button>
-              </div>
+            <div className="empty-state">
+              <div className="empty-icon">❌</div>
+              <div className="empty-text">Event not found</div>
             </div>
           ) : (
             (() => {
-              const ev = normalizeLegacyEventFields(currentEvent);
-              const regs = Array.isArray(ev.registrations) ? ev.registrations : [];
-              const cap = asIntOrNaN(ev.playerCap);
-              const capText = Number.isFinite(cap) && cap > 0 ? `${regs.length}/${cap}` : `${regs.length}/∞`;
-              const capReached = Number.isFinite(cap) && cap > 0 && regs.length >= cap;
+              const e = normalizeLegacyEventFields(currentEvent);
+              const regs = Array.isArray(e.registrations) ? e.registrations : [];
+              const cap = asIntOrNaN(e.playerCap);
+              const isFull = Number.isFinite(cap) && cap > 0 && regs.length >= cap;
 
               return (
                 <div className="detail-grid">
                   <div className="detail-card">
                     <div className="detail-hero">
-                      {ev.imageDataUrl ? <img src={ev.imageDataUrl} alt={ev.title} /> : <div className="img-placeholder hero-placeholder" />}
+                      {e.imageDataUrl ? <img src={e.imageDataUrl} alt={e.title} /> : <div className="img-placeholder hero-placeholder" />}
                     </div>
 
                     <div className="detail-content">
-                      <div className="detail-title">{ev.title}</div>
+                      <div className="detail-title">{e.title}</div>
 
                       <div className="detail-meta">
-                        <div className="meta-pill">Date: {formatDateLabel(ev.date)}</div>
-                        <div className="meta-pill">Location: {ev.location}</div>
-                        <div className="meta-pill">Pre-reg: {toMoneyEUR(ev.preregFee)}</div>
-                        <div className="meta-pill">Non-reg: {toMoneyEUR(ev.nonRegFee)}</div>
-                        <div className="meta-pill">Players: {capText}</div>
-                        <div className="meta-pill">Swiss: {ev.swissRounds || "—"}</div>
-                        <div className="meta-pill">TopCut: {ev.topCut || "—"}</div>
-                        <div className="meta-pill">Reg opens: {formatTimeLabel(ev.regStartTime)}</div>
-                        <div className="meta-pill">Starts: {formatTimeLabel(ev.tournamentStartTime)}</div>
-                        <div className="meta-pill">Pre-reg from: {formatDateLabel(ev.preregStartDate)}</div>
-                        <div className="meta-pill">Pre-reg ends: {formatDateLabel(ev.preregEndDate)}</div>
+                        <div className="meta-pill">📅 {formatDateLabel(e.date)}</div>
+                        <div className="meta-pill">📍 {e.location || "—"}</div>
+                        <div className="meta-pill">👥 {regs.length}{cap > 0 ? `/${cap}` : ""}</div>
                       </div>
 
-                      <div className="detail-description">{ev.description || "—"}</div>
-
-                      {ev.notes ? (
-                        <div className="notes-box">
-                          <div className="notes-title">Other notes</div>
-                          <div className="notes-text">{ev.notes}</div>
+                      {e.description ? (
+                        <div className="detail-text">
+                          <div className="detail-description">{e.description}</div>
                         </div>
                       ) : null}
 
-                      {admin ? (
-                        <div className="detail-actions">
-                          <button className="btn btn--ghost" onClick={() => openEdit(ev.id)}>
-                            Edit event
-                          </button>
+                      <div className="detail-meta">
+                        <div className="meta-pill">💰 PreReg: {toMoneyEUR(e.preregFee)}</div>
+                        <div className="meta-pill">💰 NonReg: {toMoneyEUR(e.nonRegFee)}</div>
+                        <div className="meta-pill">🏆 Swiss: {e.swissRounds || "—"}</div>
+                        <div className="meta-pill">🥇 TopCut: {e.topCut || "—"}</div>
+                      </div>
+
+                      <div className="detail-meta">
+                        <div className="meta-pill">⏰ Reg Start: {formatTimeLabel(e.regStartTime)}</div>
+                        <div className="meta-pill">⏰ Tournament: {formatTimeLabel(e.tournamentStartTime)}</div>
+                      </div>
+
+                      <div className="detail-meta">
+                        <div className="meta-pill">📆 PreReg Start: {formatDateLabel(e.preregStartDate)}</div>
+                        <div className="meta-pill">📆 PreReg End: {formatDateLabel(e.preregEndDate)}</div>
+                      </div>
+
+                      {e.notes ? (
+                        <div className="notes-box">
+                          <div className="notes-title">Additional Notes</div>
+                          <div className="notes-text">{e.notes}</div>
                         </div>
                       ) : null}
                     </div>
+
+                    {admin ? (
+                      <div className="detail-actions">
+                        <button className="btn btn--small" onClick={() => openEdit(e.id)}>
+                          Edit event
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
 
                   <div className="side-stack">
                     <div className="panel">
-                      <div className="panel-title">Registration</div>
-                      <div className="panel-subtitle">Fields marked with * are required.</div>
+                      <div className="panel-head">
+                        <div>
+                          <div className="panel-title">Register</div>
+                          <div className="panel-subtitle">
+                            {isFull ? "Event is full!" : `${regs.length}${cap > 0 ? `/${cap}` : ""} registered`}
+                          </div>
+                        </div>
+                      </div>
+
+                      {regMsg ? <div className={`inline-alert inline-alert--${regMsg.type}`}>{regMsg.text}</div> : null}
 
                       <div className="form">
-                        <label className="label">* First name</label>
-                        <input className="input" value={regFirst} onChange={(e) => setRegFirst(e.target.value)} placeholder="First name" />
-
-                        <label className="label">* Last name</label>
-                        <input className="input" value={regLast} onChange={(e) => setRegLast(e.target.value)} placeholder="Last name" />
-
-                        <label className="label">* Neuron ID</label>
-                        <input className="input" value={regNeuronId} onChange={(e) => setRegNeuronId(e.target.value)} placeholder="Neuron ID" />
-
-                        <div className="dual-actions">
-                          <button className="btn" onClick={submitRegistration} disabled={capReached}>
-                            {capReached ? "Player cap reached" : "Register"}
-                          </button>
-                          <button className="btn btn--ghost" onClick={submitUnregister}>
-                            Unregister
-                          </button>
+                        <div>
+                          <div className="label">First Name *</div>
+                          <input className="input" value={regFirst} onChange={(e) => setRegFirst(e.target.value)} placeholder="John" disabled={isFull} />
                         </div>
+                        <div>
+                          <div className="label">Last Name *</div>
+                          <input className="input" value={regLast} onChange={(e) => setRegLast(e.target.value)} placeholder="Doe" disabled={isFull} />
+                        </div>
+                        <div>
+                          <div className="label">Neuron ID *</div>
+                          <input className="input" value={regNeuronId} onChange={(e) => setRegNeuronId(e.target.value)} placeholder="ABC123" disabled={isFull} />
+                        </div>
+                      </div>
 
-                        {capReached ? (
-                          <div className="inline-alert inline-alert--err">Registrations are closed (player cap reached).</div>
-                        ) : null}
-
-                        {regMsg ? <div className={`inline-alert inline-alert--${regMsg.type}`}>{regMsg.text}</div> : null}
+                      <div className="dual-actions" style={{ marginTop: "12px" }}>
+                        <button className="btn" onClick={submitRegistration} disabled={isFull}>
+                          Register
+                        </button>
+                        <button className="btn btn--ghost" onClick={submitUnregister}>
+                          Unregister
+                        </button>
                       </div>
                     </div>
 
                     {admin ? (
                       <div className="panel">
                         <div className="panel-head">
-                          <div>
-                            <div className="panel-title">Registrations</div>
-                            <div className="panel-subtitle">
-                              Admin only • Total: <b>{regs.length}</b>
-                            </div>
-                          </div>
-                          <button className="btn btn--small" onClick={() => exportRegistrationsTxt(ev)} disabled={regs.length === 0}>
-                            Export .txt
-                          </button>
+                          <div className="panel-title">Registrations ({regs.length})</div>
+                          {regs.length > 0 ? (
+                            <button className="btn btn--small" onClick={() => exportRegistrationsTxt(e)}>
+                              Export
+                            </button>
+                          ) : null}
                         </div>
 
                         {regs.length === 0 ? (
@@ -863,27 +848,6 @@ export default function App() {
               );
             })()
           )}
-
-          <EventModal
-            open={modalOpen}
-            mode={modalMode}
-            initialEvent={modalMode === "edit" ? normalizeLegacyEventFields(events.find((e) => e.id === editingId) || null) : null}
-            onClose={() => setModalOpen(false)}
-            onCreate={(payload) => {
-              createEvent(payload);
-              setModalOpen(false);
-            }}
-            onUpdate={(payload) => {
-              if (!editingId) return;
-              updateEvent(editingId, payload);
-              setModalOpen(false);
-            }}
-            onDelete={(id) => {
-              if (!id) return;
-              deleteEvent(id);
-              setModalOpen(false);
-            }}
-          />
         </section>
       )}
     </div>
@@ -896,17 +860,17 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
 
   const [eventId, setEventId] = useState(null);
   const [title, setTitle] = useState("");
-  const [date, setDate] = useState(""); // DD/MM/YY
+  const [date, setDate] = useState("");
   const [location, setLocation] = useState("");
   const [preregFee, setPreregFee] = useState("");
   const [nonRegFee, setNonRegFee] = useState("");
   const [playerCap, setPlayerCap] = useState("");
   const [swissRounds, setSwissRounds] = useState("");
   const [topCut, setTopCut] = useState("");
-  const [regStartTime, setRegStartTime] = useState(""); // HH:MM
-  const [tournamentStartTime, setTournamentStartTime] = useState(""); // HH:MM
-  const [preregStartDate, setPreregStartDate] = useState(""); // DD/MM/YY
-  const [preregEndDate, setPreregEndDate] = useState(""); // DD/MM/YY
+  const [regStartTime, setRegStartTime] = useState("");
+  const [tournamentStartTime, setTournamentStartTime] = useState("");
+  const [preregStartDate, setPreregStartDate] = useState("");
+  const [preregEndDate, setPreregEndDate] = useState("");
   const [description, setDescription] = useState("");
   const [notes, setNotes] = useState("");
   const [imageDataUrl, setImageDataUrl] = useState("");
@@ -972,7 +936,7 @@ function EventModal({ open, mode, initialEvent, onClose, onCreate, onUpdate, onD
     e.stopPropagation();
     dropRef.current?.classList?.remove("dropzone--active");
     const file = e.dataTransfer?.files?.[0];
-    await pickImage(file);
+    if (file) await pickImage(file);
   }
 
   function submit() {
