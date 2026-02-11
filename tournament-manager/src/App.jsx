@@ -1,5 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
+
+function formatDateDDMMYYYY(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (isNaN(d.getTime())) return value;
+  const day = String(d.getDate()).padStart(2, "0");
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const year = d.getFullYear();
+  return `${day}/${month}/${year}`;
+}
+
 /**
  * TournamentManager (Google Sheets storage via Apps Script Web App)
  * - No custom backend server. Google Apps Script provides an HTTPS endpoint that reads/writes a Google Sheet.
@@ -119,10 +130,27 @@ function isValidTimeHHMM(s) {
 }
 
 function formatDateLabel(v) {
-  return v ? v : "—";
+  if (!v) return "—";
+  return formatDateDDMMYYYY(v);
 }
 function formatTimeLabel(v) {
-  return v ? v : "—";
+  if (!v) return "—";
+
+  // Ako već dolazi kao "HH:MM"
+  if (/^\d{1,2}:\d{2}$/.test(v)) {
+    const [h, m] = v.split(":");
+    return `${h.padStart(2, "0")}:${m}h`;
+  }
+
+  // Ako dolazi kao ISO string (npr. 2026-01-02T23:00:00.000Z)
+  const d = new Date(v);
+  if (!isNaN(d.getTime())) {
+    const hours = String(d.getHours()).padStart(2, "0");
+    const minutes = String(d.getMinutes()).padStart(2, "0");
+    return `${hours}:${minutes}h`;
+  }
+
+  return v;
 }
 
 /** API wrapper for Apps Script */
@@ -574,7 +602,7 @@ export default function App() {
                       <div className="detail-title">{ev.title}</div>
 
                       <div className="detail-meta">
-                        <div className="meta-pill">Date: {formatDateLabel(ev.date)}</div>
+                        <div className="meta-pill">Date: {formatDateLabel(event.date)}</div>
                         <div className="meta-pill">Location: {ev.location}</div>
                         <div className="meta-pill">Pre-reg: {toMoneyEUR(ev.preregFee)}</div>
                         <div className="meta-pill">Non-reg: {toMoneyEUR(ev.nonRegFee)}</div>
